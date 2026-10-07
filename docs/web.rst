@@ -118,6 +118,7 @@
    .. automethod:: RequestHandler.clear_cookie
    .. automethod:: RequestHandler.clear_all_cookies
    .. automethod:: RequestHandler.get_signed_cookie
+   .. automethod:: RequestHandler.verify_signed_cookie
    .. automethod:: RequestHandler.get_signed_cookie_key_version
    .. automethod:: RequestHandler.set_signed_cookie
    .. method:: RequestHandler.get_secure_cookie
@@ -139,6 +140,14 @@
       .. deprecated:: 6.3
 
    .. automethod:: RequestHandler.create_signed_value
+   .. autoclass:: RotatingCookieSecret
+   .. autoclass:: SignedCookieResult
+      :members:
+   .. autoclass:: SignedCookieStatus
+      :members:
+   .. autofunction:: create_signed_value
+   .. autofunction:: decode_signed_value
+   .. autofunction:: verify_signed_value
    .. autodata:: MIN_SUPPORTED_SIGNED_VALUE_VERSION
    .. autodata:: MAX_SUPPORTED_SIGNED_VALUE_VERSION
    .. autodata:: DEFAULT_SIGNED_VALUE_VERSION

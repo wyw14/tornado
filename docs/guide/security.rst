@@ -74,6 +74,68 @@ if the correct key version is set in the cookie.
 To implement cookie updates, the current signing key version can be
 queried via `~.RequestHandler.get_signed_cookie_key_version`.
 
+For a time-bounded key rotation, pass a `~tornado.web.RotatingCookieSecret`
+as the ``cookie_secret`` setting. The first entry is the current key
+(used to sign all new cookies); the following entries are retired keys
+in retirement order, each with an absolute ``retired_at`` timestamp. A
+cookie signed with a retired key is still accepted (and reported as
+`~tornado.web.SignedCookieStatus.OLD_KEY`) for a fixed
+``rotation_window_days`` period; once that window has elapsed it is
+rejected exactly like any other invalid cookie. The window is anchored
+at the key's retirement time and is never extended merely because an
+old cookie is seen again.
+
+.. testcode::
+
+    import time
+    from tornado.web import RotatingCookieSecret
+
+    # Key 1 is current; key 0 was retired an hour ago and remains
+    # accepted for another seven days.
+    cookie_secret = RotatingCookieSecret(
+        [
+            (1, "__TODO:_GENERATE_THE_NEW_RANDOM_VALUE__"),
+            (0, "__TODO:_THE_OLD_RANDOM_VALUE__", time.time() - 3600),
+        ],
+        rotation_window_days=7,
+    )
+
+    application = tornado.web.Application(
+        [(r"/", MainHandler)],
+        cookie_secret=cookie_secret,
+    )
+
+In a long-running process, call
+`~tornado.web.RotatingCookieSecret.rotate` to install a new key; the
+previous current key is retired automatically at the current time.
+
+To distinguish the possible verification results (valid with the
+current key, valid but signed with a retired key, expired, invalid),
+use `~.RequestHandler.verify_signed_cookie`, which returns a
+`~tornado.web.SignedCookieResult`. Pass ``refresh=True`` to
+`~.RequestHandler.get_signed_cookie` to transparently re-sign old-key
+cookies with the current key, so clients are gradually migrated to the
+new key:
+
+.. testcode::
+
+    class MainHandler(tornado.web.RequestHandler):
+        def get(self):
+            # Accepts cookies signed with retired keys during the
+            # rotation window and sends back the same cookie re-signed
+            # with the current key. The old key is never written back.
+            cookie = self.get_signed_cookie("mycookie", refresh=True)
+            if not cookie:
+                self.set_signed_cookie("mycookie", "myvalue")
+                self.write("Your cookie was not set yet!")
+            else:
+                self.write("Your cookie was set!")
+
+The verify-and-refresh sequence is serialized with the rotation lock
+and uses a compare-and-swap on the key version, so concurrent requests
+refreshing the same cookie can never overwrite a cookie signed with a
+newer key by one signed with an older key.
+
 .. _user-authentication:
 
 User authentication

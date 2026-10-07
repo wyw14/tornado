@@ -60,6 +60,7 @@ import base64
 import binascii
 import datetime
 import email.utils
+import enum
 import functools
 import gzip
 import hashlib
@@ -102,6 +103,8 @@ from tornado.util import ObjectDict, _websocket_mask, unicode_type
 url = URLSpec
 
 from collections.abc import Awaitable, Callable, Generator, Iterable
+from contextlib import nullcontext
+from dataclasses import dataclass
 from types import TracebackType
 from typing import (
     Any,
@@ -117,7 +120,9 @@ from typing import (
 # and related methods.
 _HeaderTypes = Union[bytes, unicode_type, int, numbers.Integral, datetime.datetime]
 
-_CookieSecretTypes = Union[str, bytes, dict[int, str], dict[int, bytes]]
+_CookieSecretTypes = Union[
+    str, bytes, dict[int, str], dict[int, bytes], "RotatingCookieSecret"
+]
 
 
 MIN_SUPPORTED_SIGNED_VALUE_VERSION = 1
@@ -151,6 +156,73 @@ May be overridden by passing a ``min_version`` keyword argument.
 
 .. versionadded:: 3.2.1
 """
+
+
+class SignedCookieStatus(enum.Enum):
+    """The outcome of verifying a signed cookie.
+
+    Note that the rejection states (everything except `VALID` and
+    `OLD_KEY`) all result in `.RequestHandler.get_signed_cookie`
+    returning ``None``; the states only differ in how they are reported
+    by `.RequestHandler.verify_signed_cookie` (and
+    `verify_signed_value`).
+
+    .. versionadded:: 6.6
+    """
+
+    VALID = "valid"
+    """The cookie is valid and was signed with the current key."""
+
+    OLD_KEY = "old_key"
+    """The cookie is valid, but a retired key signed it within the rotation
+    window.
+
+    The value is accepted, but should be re-signed with the current key
+    (see the ``refresh`` argument to
+    `.RequestHandler.get_signed_cookie`).
+    """
+
+    EXPIRED = "expired"
+    """The signature is valid but the cookie is older than
+    ``max_age_days``.
+    """
+
+    INVALID = "invalid"
+    """The cookie could not be verified.
+
+    This covers malformed values, bad or missing signatures, unknown key
+    versions, empty key lists, and cookies signed with retired keys
+    whose rotation window has elapsed.
+    """
+
+
+@dataclass(frozen=True)
+class SignedCookieResult:
+    """The result of verifying a signed cookie.
+
+    ``value`` (and usually ``key_version``) is populated only when
+    ``status`` is `SignedCookieStatus.VALID` or
+    `SignedCookieStatus.OLD_KEY`; otherwise it is ``None``.
+
+    .. versionadded:: 6.6
+    """
+
+    status: SignedCookieStatus
+    value: Optional[bytes] = None
+    key_version: Optional[int] = None
+
+    @property
+    def accepted(self) -> bool:
+        """Whether the cookie value should be accepted."""
+        return self.status in (
+            SignedCookieStatus.VALID,
+            SignedCookieStatus.OLD_KEY,
+        )
+
+    @property
+    def needs_refresh(self) -> bool:
+        """Whether the cookie must be re-signed with the current key."""
+        return self.status == SignedCookieStatus.OLD_KEY
 
 
 class _ArgDefaultMarker:
@@ -862,11 +934,19 @@ class RequestHandler:
 
            Added the ``version`` argument.  Introduced cookie version 2
            and made it the default.
+
+        .. versionchanged:: 6.6
+
+           ``cookie_secret`` may now be a `RotatingCookieSecret`; in
+           that case its current key is always used for signing and the
+           ``key_version`` application setting is ignored.
         """
         self.require_setting("cookie_secret", "secure cookies")
         secret = self.application.settings["cookie_secret"]
         key_version = None
-        if isinstance(secret, dict):
+        if isinstance(secret, RotatingCookieSecret):
+            key_version = secret.key_version
+        elif isinstance(secret, dict):
             if self.application.settings.get("key_version") is None:
                 raise Exception("key_version setting must be used for secret_key dicts")
             key_version = self.application.settings["key_version"]
@@ -881,6 +961,8 @@ class RequestHandler:
         value: str | None = None,
         max_age_days: float = 31,
         min_version: int | None = None,
+        refresh: bool = False,
+        expires_days: float | None = 30,
     ) -> bytes | None:
         """Returns the given signed cookie if it validates, or None.
 
@@ -891,22 +973,84 @@ class RequestHandler:
         were present in the request. It does not see outgoing cookies set by
         `set_signed_cookie` in this handler.
 
+        If ``refresh`` is true and the presented cookie was signed with a
+        retired key of a `RotatingCookieSecret` (i.e. its verification
+        status is `SignedCookieStatus.OLD_KEY`), an outgoing cookie with
+        the same value is queued with `set_cookie`, re-signed with the
+        *current* key. The old key is never written back to the client.
+        Cookies in any other state are returned (or rejected, returning
+        ``None``) without setting a cookie. Concurrent refreshes are
+        serialized and never replace a cookie signed with a newer key
+        version by one signed with an older version.
+
+        ``expires_days`` controls the browser-side lifetime of a cookie
+        set while refreshing; it is ignored otherwise.
+
         .. versionchanged:: 3.2.1
 
            Added the ``min_version`` argument.  Introduced cookie version 2;
            both versions 1 and 2 are accepted by default.
 
-         .. versionchanged:: 6.3
+        .. versionchanged:: 6.3
 
            Renamed from ``get_secure_cookie`` to ``get_signed_cookie`` to
            avoid confusion with other uses of "secure" in cookie attributes
            and prefixes. The old name remains as an alias.
 
+        .. versionchanged:: 6.6
+
+           Added the ``refresh`` and ``expires_days`` arguments to
+           support signing key rotation with a `RotatingCookieSecret`.
+
         """
         self.require_setting("cookie_secret", "secure cookies")
         if value is None:
             value = self.get_cookie(name)
-        return decode_signed_value(
+        result = verify_signed_value(
+            self.application.settings["cookie_secret"],
+            name,
+            value,
+            max_age_days=max_age_days,
+            min_version=min_version,
+        )
+        if refresh and result.needs_refresh:
+            assert result.value is not None
+            self._refresh_signed_cookie(name, result.value, expires_days=expires_days)
+        if result.accepted:
+            return result.value
+        return None
+
+    get_secure_cookie = get_signed_cookie
+
+    def verify_signed_cookie(
+        self,
+        name: str,
+        value: str | None = None,
+        max_age_days: float = 31,
+        min_version: int | None = None,
+    ) -> SignedCookieResult:
+        """Verifies a signed cookie and returns a detailed
+        `SignedCookieResult`.
+
+        Like `get_signed_cookie`, but distinguishes cookies signed with
+        the current key (`SignedCookieStatus.VALID`) from those signed
+        with a retired key within its rotation window
+        (`SignedCookieStatus.OLD_KEY`), expired cookies
+        (`SignedCookieStatus.EXPIRED`) and all other rejections
+        (`SignedCookieStatus.INVALID`, which includes tampered cookies,
+        unknown key versions, empty key lists and retired keys whose
+        rotation window has elapsed).
+
+        This method never sets outgoing cookies; pass ``refresh=True`` to
+        `get_signed_cookie` to re-sign old-key cookies with the current
+        key.
+
+        .. versionadded:: 6.6
+        """
+        self.require_setting("cookie_secret", "secure cookies")
+        if value is None:
+            value = self.get_cookie(name)
+        return verify_signed_value(
             self.application.settings["cookie_secret"],
             name,
             value,
@@ -914,7 +1058,54 @@ class RequestHandler:
             min_version=min_version,
         )
 
-    get_secure_cookie = get_signed_cookie
+    def _refresh_signed_cookie(
+        self, name: str, value: bytes, expires_days: float | None = 30
+    ) -> None:
+        """Re-signs ``value`` with the current key and queues an outgoing cookie.
+
+        The key of the presented (old) cookie is never reused. The whole
+        verify-sign-write sequence is serialized on the
+        `RotatingCookieSecret` lock, and a compare-and-swap on the key
+        version ensures a concurrently refreshed cookie can never be
+        downgraded to an older key version.
+        """
+        secret = self.application.settings["cookie_secret"]
+        if isinstance(secret, RotatingCookieSecret):
+            lock: Any = secret.lock
+        else:
+            lock = nullcontext()
+        with lock:
+            # Sign with the key that is current *now*; rotate() takes the
+            # same lock so it cannot interleave between signing and writing.
+            signed_value = self.create_signed_value(name, value)
+            new_key_version = get_signature_key_version(signed_value)
+            existing = self._peek_signed_cookie(name)
+            if existing is not None:
+                existing_key_version = get_signature_key_version(existing)
+                if (
+                    existing_key_version is not None
+                    and new_key_version is not None
+                    and existing_key_version >= new_key_version
+                ):
+                    # A newer (or equally new) signature is already in place;
+                    # never overwrite it with an older version.
+                    return
+            self.set_cookie(name, signed_value, expires_days=expires_days)
+
+    def _peek_signed_cookie(self, name: str) -> bytes | None:
+        """Returns the current value of a cookie being (re-)written, if any.
+
+        Checks the outgoing cookies first and falls back to the request
+        cookies (which are also the write target in lightweight handler
+        stubs). Used only for the refresh compare-and-swap.
+        """
+        new_cookie = getattr(self, "_new_cookie", None)
+        if new_cookie is not None and name in new_cookie:
+            return utf8(new_cookie[name].value)
+        existing = self.get_cookie(name)
+        if existing:
+            return utf8(existing)
+        return None
 
     def get_signed_cookie_key_version(
         self, name: str, value: str | None = None
@@ -3574,6 +3765,18 @@ def create_signed_value(
     if clock is None:
         clock = time.time
 
+    if isinstance(secret, RotatingCookieSecret):
+        # Signing always uses the current key, regardless of the key
+        # version embedded in any presented cookie.
+        if key_version is not None and key_version != secret.key_version:
+            raise ValueError(
+                "key_version %d does not match the current key version %d "
+                "of the RotatingCookieSecret"
+                % (key_version, secret.key_version)
+            )
+        key_version = secret.key_version
+        secret = secret.current_secret
+
     timestamp = utf8(str(int(clock())))
     value = base64.b64encode(utf8(value))
     if version == 1:
@@ -3651,6 +3854,59 @@ def _get_version(value: bytes) -> int:
     return version
 
 
+def verify_signed_value(
+    secret: _CookieSecretTypes,
+    name: str,
+    value: None | str | bytes,
+    max_age_days: float = 31,
+    clock: Callable[[], float] | None = None,
+    min_version: int | None = None,
+) -> SignedCookieResult:
+    """Verifies a signed value and returns a `SignedCookieResult`.
+
+    This is like `decode_signed_value`, but the status of the result
+    distinguishes values signed with the current key
+    (`SignedCookieStatus.VALID`) from those signed with a retired key
+    within its rotation window (`SignedCookieStatus.OLD_KEY`), expired
+    values (`SignedCookieStatus.EXPIRED`) and all other rejections
+    (`SignedCookieStatus.INVALID`).
+
+    A missing or empty value, an unknown format or key version, an
+    empty key collection, a tampered signature, or a retired key whose
+    rotation window has elapsed all produce
+    `SignedCookieStatus.INVALID`.
+
+    .. versionadded:: 6.6
+    """
+    if clock is None:
+        clock = time.time
+    if min_version is None:
+        min_version = DEFAULT_SIGNED_VALUE_MIN_VERSION
+    if min_version > 2:
+        raise ValueError("Unsupported min_version %d" % min_version)
+    if not value:
+        return SignedCookieResult(SignedCookieStatus.INVALID)
+
+    value = utf8(value)
+    version = _get_version(value)
+
+    if version < min_version:
+        return SignedCookieResult(SignedCookieStatus.INVALID)
+    if version == 1:
+        if isinstance(secret, (dict, RotatingCookieSecret)):
+            # Version 1 values carry no key version and cannot be
+            # matched against a key collection; treat them as invalid
+            # rather than raising an assertion error on malformed
+            # input.
+            return SignedCookieResult(SignedCookieStatus.INVALID)
+        return _verify_signed_value_v1(secret, name, value, max_age_days, clock)
+    elif version == 2:
+        return _verify_signed_value_v2(secret, name, value, max_age_days, clock)
+    else:
+        # Unknown (newer than supported) format version.
+        return SignedCookieResult(SignedCookieStatus.INVALID)
+
+
 def decode_signed_value(
     secret: _CookieSecretTypes,
     name: str,
@@ -3659,47 +3915,37 @@ def decode_signed_value(
     clock: Callable[[], float] | None = None,
     min_version: int | None = None,
 ) -> bytes | None:
-    if clock is None:
-        clock = time.time
-    if min_version is None:
-        min_version = DEFAULT_SIGNED_VALUE_MIN_VERSION
-    if min_version > 2:
-        raise ValueError("Unsupported min_version %d" % min_version)
-    if not value:
-        return None
-
-    value = utf8(value)
-    version = _get_version(value)
-
-    if version < min_version:
-        return None
-    if version == 1:
-        assert not isinstance(secret, dict)
-        return _decode_signed_value_v1(secret, name, value, max_age_days, clock)
-    elif version == 2:
-        return _decode_signed_value_v2(secret, name, value, max_age_days, clock)
-    else:
-        return None
+    result = verify_signed_value(
+        secret,
+        name,
+        value,
+        max_age_days=max_age_days,
+        clock=clock,
+        min_version=min_version,
+    )
+    if result.accepted:
+        return result.value
+    return None
 
 
-def _decode_signed_value_v1(
+def _verify_signed_value_v1(
     secret: str | bytes,
     name: str,
     value: bytes,
     max_age_days: float,
     clock: Callable[[], float],
-) -> bytes | None:
+) -> SignedCookieResult:
     parts = utf8(value).split(b"|")
     if len(parts) != 3:
-        return None
+        return SignedCookieResult(SignedCookieStatus.INVALID)
     signature = _create_signature_v1(secret, name, parts[0], parts[1])
     if not hmac.compare_digest(parts[2], signature):
         gen_log.warning("Invalid cookie signature %r", value)
-        return None
+        return SignedCookieResult(SignedCookieStatus.INVALID)
     timestamp = int(parts[1])
     if timestamp < clock() - max_age_days * 86400:
         gen_log.warning("Expired cookie %r", value)
-        return None
+        return SignedCookieResult(SignedCookieStatus.EXPIRED)
     if timestamp > clock() + 31 * 86400:
         # _cookie_signature does not hash a delimiter between the
         # parts of the cookie, so an attacker could transfer trailing
@@ -3707,14 +3953,17 @@ def _decode_signed_value_v1(
         # signature.  For backwards compatibility, sanity-check timestamp
         # here instead of modifying _cookie_signature.
         gen_log.warning("Cookie timestamp in future; possible tampering %r", value)
-        return None
+        return SignedCookieResult(SignedCookieStatus.INVALID)
     if parts[1].startswith(b"0"):
         gen_log.warning("Tampered cookie %r", value)
-        return None
+        return SignedCookieResult(SignedCookieStatus.INVALID)
     try:
-        return base64.b64decode(parts[0])
+        decoded = base64.b64decode(parts[0])
     except Exception:
-        return None
+        return SignedCookieResult(SignedCookieStatus.INVALID)
+    # The v1 format has no key version marker, so it can never be in
+    # the old-key state.
+    return SignedCookieResult(SignedCookieStatus.VALID, decoded)
 
 
 def _decode_fields_v2(value: bytes) -> tuple[int, bytes, bytes, bytes, bytes]:
@@ -3737,13 +3986,13 @@ def _decode_fields_v2(value: bytes) -> tuple[int, bytes, bytes, bytes, bytes]:
     return int(key_version), timestamp, name_field, value_field, passed_sig
 
 
-def _decode_signed_value_v2(
+def _verify_signed_value_v2(
     secret: _CookieSecretTypes,
     name: str,
     value: bytes,
     max_age_days: float,
     clock: Callable[[], float],
-) -> bytes | None:
+) -> SignedCookieResult:
     try:
         (
             key_version,
@@ -3753,28 +4002,54 @@ def _decode_signed_value_v2(
             passed_sig,
         ) = _decode_fields_v2(value)
     except ValueError:
-        return None
+        return SignedCookieResult(SignedCookieStatus.INVALID)
     signed_string = value[: -len(passed_sig)]
 
-    if isinstance(secret, dict):
+    signed_with_old_key = False
+    if isinstance(secret, RotatingCookieSecret):
+        resolved = secret.resolve(key_version, clock)
+        if resolved is None:
+            # Unknown key version, or a retired key whose rotation
+            # window has elapsed. Both are rejected like any other
+            # invalid cookie.
+            return SignedCookieResult(
+                SignedCookieStatus.INVALID, key_version=key_version
+            )
+        signing_secret, signed_with_old_key = resolved
+    elif isinstance(secret, dict):
         try:
-            secret = secret[key_version]
+            signing_secret = secret[key_version]
         except KeyError:
-            return None
+            # Unknown key version. Plain secret dicts have no rotation
+            # window, so a missing key is simply invalid.
+            return SignedCookieResult(
+                SignedCookieStatus.INVALID, key_version=key_version
+            )
+    else:
+        signing_secret = secret
 
-    expected_sig = _create_signature_v2(secret, signed_string)
+    expected_sig = _create_signature_v2(signing_secret, signed_string)
     if not hmac.compare_digest(passed_sig, expected_sig):
-        return None
+        return SignedCookieResult(SignedCookieStatus.INVALID, key_version=key_version)
     if name_field != utf8(name):
-        return None
-    timestamp = int(timestamp_bytes)
+        return SignedCookieResult(SignedCookieStatus.INVALID, key_version=key_version)
+    try:
+        timestamp = int(timestamp_bytes)
+    except ValueError:
+        return SignedCookieResult(SignedCookieStatus.INVALID, key_version=key_version)
     if timestamp < clock() - max_age_days * 86400:
         # The signature has expired.
-        return None
+        return SignedCookieResult(SignedCookieStatus.EXPIRED, key_version=key_version)
     try:
-        return base64.b64decode(value_field)
+        decoded = base64.b64decode(value_field)
     except Exception:
-        return None
+        return SignedCookieResult(SignedCookieStatus.INVALID, key_version=key_version)
+    status = (
+        SignedCookieStatus.OLD_KEY
+        if signed_with_old_key
+        else SignedCookieStatus.VALID
+    )
+    return SignedCookieResult(status, decoded, key_version)
 
 
 def get_signature_key_version(value: str | bytes) -> int | None:
@@ -3788,6 +4063,192 @@ def get_signature_key_version(value: str | bytes) -> int | None:
         return None
 
     return key_version
+
+
+# A retired key: its version, its secret, and the absolute time at which
+# it was retired. The rotation window is always measured relative to this
+# fixed timestamp and is never extended when old cookies are seen.
+_RetiredKey = tuple[int, Union[str, bytes], float]
+
+# An entry of the ordered key list passed to RotatingCookieSecret: either
+# the current ``(version, secret)`` pair or a retired
+# ``(version, secret, retired_at)`` triple.
+_CookieKeyEntry = Union[
+    tuple[int, Union[str, bytes]],
+    tuple[int, Union[str, bytes], float],
+]
+
+
+class RotatingCookieSecret:
+    """An ordered collection of signing keys with a bounded rotation window.
+
+    Use an instance of this class as the ``cookie_secret`` application
+    setting to rotate signing keys without immediately invalidating
+    cookies signed with older keys.
+
+    ``keys`` is an ordered, non-empty list of key entries. The first
+    entry is the *current* key (a ``(version, secret)`` pair) and is the
+    only key used to sign new cookies. The following entries are retired
+    keys (``(version, secret, retired_at)`` triples, where
+    ``retired_at`` is an absolute timestamp as returned by
+    `time.time`), ordered from the most recently retired to the oldest.
+
+    A cookie signed with a retired key verifies as
+    `SignedCookieStatus.OLD_KEY` while the fixed rotation window (of
+    ``rotation_window_days`` days, measured from the key's
+    ``retired_at``) is still open, and as
+    `SignedCookieStatus.INVALID` once the window has elapsed. Verifying
+    or re-signing a cookie never extends the window, so the
+    compatibility period cannot grow indefinitely.
+
+    Retired keys are tried in their list order, so the key version
+    embedded in a cookie should be unique (duplicate versions are
+    rejected). To rotate the key at runtime call `rotate`, which
+    retires the current key and installs the new one.
+
+    Instances are safe to share between threads. The internal lock is
+    also used by `.RequestHandler.get_signed_cookie` when
+    ``refresh=True``, making the verify-and-re-sign sequence atomic
+    with respect to `rotate` and to concurrent refreshes; a
+    compare-and-swap on the key version additionally ensures a cookie
+    signed with a newer key is never overwritten by one signed with an
+    older version.
+
+    .. versionadded:: 6.6
+    """
+
+    def __init__(
+        self,
+        keys: Iterable[_CookieKeyEntry],
+        *,
+        rotation_window_days: float = 7,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> None:
+        key_list = list(keys)
+        if len(key_list) == 0:
+            raise ValueError(
+                "RotatingCookieSecret requires at least the current key; "
+                "an empty key list cannot sign or verify anything"
+            )
+        if rotation_window_days <= 0:
+            raise ValueError("rotation_window_days must be positive")
+        current, *retired = key_list
+        if len(current) != 2:
+            raise ValueError(
+                "the first key entry must be a (version, secret) pair "
+                "representing the current key"
+            )
+        current_version, current_secret = current
+        self._validate_version(current_version)
+        self._current_version: int = current_version
+        self._current_secret: Union[str, bytes] = current_secret
+        self._old_keys: list[_RetiredKey] = []
+        for entry in retired:
+            if len(entry) != 3:
+                raise ValueError(
+                    "retired key entries must be (version, secret, retired_at) "
+                    "triples"
+                )
+            self._add_retired(entry[0], entry[1], entry[2])
+        if clock is None:
+            clock = time.time
+        self._clock = clock
+        self._rotation_window_seconds = rotation_window_days * 86400
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _validate_version(version: Any) -> None:
+        if isinstance(version, bool) or not isinstance(version, int) or version < 0:
+            raise ValueError("key versions must be non-negative integers")
+
+    def _add_retired(
+        self, version: int, secret: Union[str, bytes], retired_at: float
+    ) -> None:
+        self._validate_version(version)
+        if version == self._current_version or any(
+            version == old_version for old_version, _, _ in self._old_keys
+        ):
+            raise ValueError("duplicate key version %d" % version)
+        self._old_keys.append((version, secret, float(retired_at)))
+
+    @property
+    def key_version(self) -> int:
+        """The version of the current (signing) key."""
+        return self._current_version
+
+    @property
+    def current_secret(self) -> Union[str, bytes]:
+        """The current (signing) secret."""
+        return self._current_secret
+
+    @property
+    def rotation_window_seconds(self) -> float:
+        """The fixed window during which a retired key remains accepted."""
+        return self._rotation_window_seconds
+
+    @property
+    def lock(self) -> threading.RLock:
+        """The lock serializing rotation and verify-and-refresh operations."""
+        return self._lock
+
+    def rotate(self, key_version: int, secret: Union[str, bytes]) -> None:
+        """Installs ``key_version``/``secret`` as the current key.
+
+        The previous current key becomes a retired key with its
+        retirement timestamp fixed to the current clock, beginning its
+        rotation window. May be called repeatedly to perform multiple
+        rotations.
+        """
+        self._validate_version(key_version)
+        with self._lock:
+            if key_version == self._current_version:
+                raise ValueError(
+                    "key version %d is already the current key" % key_version
+                )
+            if any(
+                key_version == old_version for old_version, _, _ in self._old_keys
+            ):
+                raise ValueError("duplicate key version %d" % key_version)
+            retired_at = self._clock()
+            previous = (
+                self._current_version,
+                self._current_secret,
+                retired_at,
+            )
+            self._old_keys.insert(0, previous)
+            self._current_version = key_version
+            self._current_secret = secret
+
+    def resolve(
+        self,
+        key_version: int,
+        clock: Optional[Callable[[], float]] = None,
+    ) -> Optional[tuple[Union[str, bytes], bool]]:
+        """Resolves ``key_version`` to ``(secret, is_old_key)``.
+
+        Returns the current secret with ``is_old_key=False`` for the
+        current key version. Retired keys are inspected in their
+        ordered list and resolve to ``(secret, True)`` while their
+        fixed rotation window is still open. Returns ``None`` when the
+        version is unknown or when the key's window has elapsed; both
+        cases must be treated like an invalid signature.
+        """
+        if clock is None:
+            clock = self._clock
+        now = clock()
+        with self._lock:
+            if key_version == self._current_version:
+                return self._current_secret, False
+            for version, secret, retired_at in self._old_keys:
+                if version == key_version:
+                    if now <= retired_at + self._rotation_window_seconds:
+                        return secret, True
+                    # The rotation window has elapsed. The key is not
+                    # resolved so the cookie is rejected like any
+                    # other invalid cookie; this does not extend the
+                    # window.
+                    return None
+            return None
 
 
 def _create_signature_v1(secret: str | bytes, *parts: str | bytes) -> bytes:

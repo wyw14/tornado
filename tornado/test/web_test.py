@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import socket
+import threading
+import time
 import typing
 import unittest
 import urllib.parse
@@ -46,6 +48,8 @@ from tornado.web import (
 from tornado.web import RedirectHandler as WebRedirectHandler
 from tornado.web import (
     RequestHandler,
+    RotatingCookieSecret,
+    SignedCookieStatus,
     StaticFileHandler,
     UIModule,
     _create_signature_v1,
@@ -57,6 +61,7 @@ from tornado.web import (
     removeslash,
     stream_request_body,
     url,
+    verify_signed_value,
 )
 
 
@@ -220,6 +225,473 @@ class SecureCookieV2Test(unittest.TestCase):
         )
         new_handler._cookies = handler._cookies
         self.assertEqual(new_handler.get_signed_cookie("foo"), None)
+
+
+# Tests for time-bounded signing key rotation: ordered old keys, the three
+# distinguished verification outcomes, fixed (non-sliding) rotation windows
+# and atomic, never-downgrading cookie refreshes. See also SignedValueTest.
+class RotatingSignedCookieTest(unittest.TestCase):
+    OLD_SECRET = "old-secret-0000"
+    MID_SECRET = "mid-secret-1111"
+    NEW_SECRET = "new-secret-2222"
+    WINDOW_DAYS = 1.0
+
+    def setUp(self):
+        # A controllable clock for the module-level tests.
+        self.now = 1_000_000.0
+        self.secret = RotatingCookieSecret(
+            [
+                (2, self.NEW_SECRET),
+                (1, self.MID_SECRET, self.now - 3600),
+                (0, self.OLD_SECRET, self.now - 7200),
+            ],
+            rotation_window_days=self.WINDOW_DAYS,
+            clock=lambda: self.now,
+        )
+
+    def signed_with(
+        self,
+        secret: str,
+        key_version: int,
+        *,
+        name: str = "foo",
+        value: bytes = b"bar",
+        at: float | None = None,
+    ) -> bytes:
+        clock = (lambda: at) if at is not None else (lambda: self.now)
+        return create_signed_value(
+            secret, name, value, key_version=key_version, clock=clock
+        )
+
+    def old_cookie(self, **kwargs: typing.Any) -> bytes:
+        return self.signed_with(self.OLD_SECRET, 0, **kwargs)
+
+    def verify(self, signed: bytes | None, name: str = "foo", **kwargs: typing.Any):
+        # Module-level checks run against the controllable fake clock.
+        kwargs.setdefault("clock", lambda: self.now)
+        return verify_signed_value(self.secret, name, signed, **kwargs)
+
+    def decode(self, signed: bytes | None, name: str = "foo", **kwargs: typing.Any):
+        kwargs.setdefault("clock", lambda: self.now)
+        return decode_signed_value(self.secret, name, signed, **kwargs)
+
+    # ---- construction / configuration ----
+
+    def test_empty_key_list_rejected(self):
+        with self.assertRaises(ValueError):
+            RotatingCookieSecret([])
+
+    def test_non_positive_window_rejected(self):
+        with self.assertRaises(ValueError):
+            RotatingCookieSecret([(0, self.OLD_SECRET)], rotation_window_days=0)
+
+    def test_duplicate_key_versions_rejected(self):
+        with self.assertRaises(ValueError):
+            RotatingCookieSecret(
+                [(1, self.NEW_SECRET), (1, self.OLD_SECRET, self.now)]
+            )
+
+    def test_first_entry_must_be_current_pair(self):
+        with self.assertRaises(ValueError):
+            RotatingCookieSecret(
+                [(1, self.NEW_SECRET, self.now)]
+            )
+
+    # ---- signing ----
+
+    def test_signing_always_uses_current_key(self):
+        signed = create_signed_value(self.secret, "foo", b"bar")
+        self.assertEqual(get_signature_key_version(signed), 2)
+        # It must not be possible to force signing with a retired key.
+        with self.assertRaises(ValueError):
+            create_signed_value(
+                self.secret, "foo", b"bar", key_version=0
+            )
+
+    # ---- verification states ----
+
+    def test_current_key_is_valid(self):
+        signed = create_signed_value(self.secret, "foo", b"bar")
+        result = self.verify(signed)
+        self.assertEqual(result.status, SignedCookieStatus.VALID)
+        self.assertEqual(result.value, b"bar")
+        self.assertEqual(result.key_version, 2)
+        self.assertTrue(result.accepted)
+        self.assertFalse(result.needs_refresh)
+
+    def test_old_key_is_accepted_within_window(self):
+        signed = self.old_cookie()
+        result = self.verify(signed)
+        self.assertEqual(result.status, SignedCookieStatus.OLD_KEY)
+        self.assertEqual(result.value, b"bar")
+        self.assertEqual(result.key_version, 0)
+        self.assertTrue(result.accepted)
+        self.assertTrue(result.needs_refresh)
+        # Legacy API returns the value like any valid cookie.
+        self.assertEqual(self.decode(signed), b"bar")
+
+    def test_ordered_old_keys_tried_in_order(self):
+        # Both retired keys are accepted and marked old.
+        for version, secret in ((1, self.MID_SECRET), (0, self.OLD_SECRET)):
+            signed = self.signed_with(secret, version)
+            result = self.verify(signed)
+            self.assertEqual(result.status, SignedCookieStatus.OLD_KEY)
+            self.assertEqual(result.key_version, version)
+            self.assertEqual(result.value, b"bar")
+
+    def test_unknown_key_version_is_rejected(self):
+        signed = self.signed_with("unknown-secret", 99)
+        result = self.verify(signed)
+        self.assertEqual(result.status, SignedCookieStatus.INVALID)
+        self.assertIsNone(result.value)
+        self.assertIsNone(self.decode(signed))
+        # Same rejection for plain secret dicts.
+        with self.assertRaises(KeyError):
+            create_signed_value({}, "foo", b"bar", key_version=0)
+        self.assertIsNone(
+            decode_signed_value({}, "foo", signed, clock=lambda: self.now)
+        )
+
+    def test_unknown_format_version_is_rejected(self):
+        result = self.verify(b"3|1:0|10:1000000|3:foo|8:YmFy|abcd")
+        self.assertEqual(result.status, SignedCookieStatus.INVALID)
+
+    def test_malformed_cookie_is_rejected(self):
+        for malformed in (b"", None, b"2|1:0", b"garbage"):
+            result = self.verify(malformed)
+            self.assertEqual(
+                result.status,
+                SignedCookieStatus.INVALID,
+                f"expected INVALID for {malformed!r}",
+            )
+
+    def test_tampered_signature_is_rejected(self):
+        signed = self.old_cookie()
+        tampered = signed[:-1] + (b"0" if signed[-1:] != b"0" else b"1")
+        result = self.verify(tampered)
+        self.assertEqual(result.status, SignedCookieStatus.INVALID)
+        self.assertIsNone(self.decode(tampered))
+
+    def test_wrong_old_secret_is_invalid(self):
+        # A signature made by a key version that exists but with a
+        # different secret must fail signature verification.
+        signed = self.signed_with("not-the-retired-secret", 0)
+        result = self.verify(signed)
+        self.assertEqual(result.status, SignedCookieStatus.INVALID)
+
+    def test_name_swap_is_invalid(self):
+        signed = self.old_cookie(name="foo")
+        result = self.verify(signed, name="other")
+        self.assertEqual(result.status, SignedCookieStatus.INVALID)
+
+    def test_expired_is_distinct_from_old_key_and_invalid(self):
+        signed = self.old_cookie(at=self.now - 32 * 86400)
+        result = self.verify(signed, max_age_days=31)
+        self.assertEqual(result.status, SignedCookieStatus.EXPIRED)
+        self.assertIsNone(result.value)
+        self.assertIsNone(self.decode(signed, max_age_days=31))
+
+    # ---- rotation window semantics ----
+
+    def test_old_key_rejected_after_window_like_invalid_cookie(self):
+        # Retired at now-7200 with a 1-day window; advance past it.
+        self.now += 86400 + 7200 + 1
+        signed = self.old_cookie()
+        result = self.verify(signed)
+        # Must be rejected exactly like an ordinary invalid cookie, not
+        # merely expired, and the window cannot be extended.
+        self.assertEqual(result.status, SignedCookieStatus.INVALID)
+        self.assertIsNone(result.value)
+        self.assertIsNone(self.decode(signed))
+
+    def test_window_is_fixed_and_never_slides(self):
+        signed = self.old_cookie()
+        deadline = (self.now - 7200) + self.WINDOW_DAYS * 86400
+        # Repeatedly seeing an old-key cookie near the end of the window
+        # does not extend it.
+        self.now = deadline - 1
+        for _ in range(3):
+            result = self.verify(signed)
+            self.assertEqual(result.status, SignedCookieStatus.OLD_KEY)
+        self.now = deadline + 1
+        result = self.verify(signed)
+        self.assertEqual(result.status, SignedCookieStatus.INVALID)
+
+    def test_windows_are_per_key_after_multiple_rotations(self):
+        # Rotate again: key 2 is retired at the current clock and key 3
+        # becomes current. Key 0's deadline stays anchored at its own
+        # retirement time and is not extended by the new rotation.
+        # Offsets: key 0 retired 7200s ago (deadline already passed at
+        # now+80000), key 1 retired 3600s ago (window still open).
+        self.now += 80000
+        self.secret.rotate(3, "third-secret")
+        key0 = self.old_cookie()
+        key1 = self.signed_with(self.MID_SECRET, 1)
+        key2 = self.signed_with(self.NEW_SECRET, 2)
+        self.assertEqual(
+            self.verify(key0).status,
+            SignedCookieStatus.INVALID,
+        )
+        self.assertEqual(
+            self.verify(key1).status,
+            SignedCookieStatus.OLD_KEY,
+        )
+        self.assertEqual(
+            self.verify(key2).status,
+            SignedCookieStatus.OLD_KEY,
+        )
+        self.assertEqual(self.secret.key_version, 3)
+
+    def test_rotate_rejects_existing_versions(self):
+        with self.assertRaises(ValueError):
+            self.secret.rotate(1, "again")
+        with self.assertRaises(ValueError):
+            self.secret.rotate(2, "again")
+
+    # ---- handler integration ----
+
+    def handler(self, secret: object | None = None) -> CookieTestRequestHandler:
+        return CookieTestRequestHandler(
+            cookie_secret=self.secret if secret is None else secret
+        )
+
+    def real_secret(self) -> RotatingCookieSecret:
+        # A secret on the real clock; handler methods use time.time().
+        now = time.time()
+        return RotatingCookieSecret(
+            [
+                (2, self.NEW_SECRET),
+                (1, self.MID_SECRET, now - 1800),
+                (0, self.OLD_SECRET, now - 3600),
+            ],
+            rotation_window_days=1,
+        )
+
+    def test_handler_verify_reports_all_states(self):
+        secret = self.real_secret()
+        handler = self.handler(secret)
+        now = time.time()
+        handler._cookies["old"] = self.signed_with(
+            self.OLD_SECRET, 0, name="old", at=now
+        )
+        handler._cookies["cur"] = create_signed_value(
+            secret, "cur", b"v"
+        )
+        handler._cookies["exp"] = self.signed_with(
+            self.OLD_SECRET, 0, name="exp", at=now - 32 * 86400
+        )
+        handler._cookies["bad"] = b"not-a-cookie"
+        self.assertEqual(
+            handler.verify_signed_cookie("old").status,
+            SignedCookieStatus.OLD_KEY,
+        )
+        self.assertEqual(
+            handler.verify_signed_cookie("cur").status,
+            SignedCookieStatus.VALID,
+        )
+        self.assertEqual(
+            handler.verify_signed_cookie("exp").status,
+            SignedCookieStatus.EXPIRED,
+        )
+        self.assertEqual(
+            handler.verify_signed_cookie("bad").status,
+            SignedCookieStatus.INVALID,
+        )
+        result = handler.verify_signed_cookie("missing")
+        self.assertEqual(result.status, SignedCookieStatus.INVALID)
+        self.assertIsNone(result.value)
+
+    def test_handler_refresh_re_signs_with_current_key(self):
+        secret = self.real_secret()
+        handler = self.handler(secret)
+        old = self.signed_with(self.OLD_SECRET, 0, at=time.time())
+        handler._cookies["foo"] = old
+        self.assertEqual(get_signature_key_version(old), 0)
+
+        value = handler.get_signed_cookie("foo", refresh=True)
+        self.assertEqual(value, b"bar")
+        written = handler._cookies["foo"]
+        # The response carries the cookie signed with the current key;
+        # the old key must never be written back to the client.
+        self.assertEqual(get_signature_key_version(written), 2)
+        refreshed = verify_signed_value(secret, "foo", written)
+        self.assertEqual(refreshed.status, SignedCookieStatus.VALID)
+
+    def test_handler_plain_get_does_not_refresh(self):
+        handler = self.handler(self.real_secret())
+        old = self.signed_with(self.OLD_SECRET, 0, at=time.time())
+        handler._cookies["foo"] = old
+        self.assertEqual(handler.get_signed_cookie("foo"), b"bar")
+        # No refresh: the old signature is left untouched.
+        self.assertEqual(handler._cookies["foo"], old)
+
+    def test_handler_valid_cookie_is_not_rewritten(self):
+        secret = self.real_secret()
+        handler = self.handler(secret)
+        current = create_signed_value(secret, "foo", b"bar")
+        handler._cookies["foo"] = current
+        self.assertEqual(handler.get_signed_cookie("foo", refresh=True), b"bar")
+        self.assertEqual(handler._cookies["foo"], current)
+
+    def test_handler_rejected_cookies_set_nothing(self):
+        handler = self.handler(self.real_secret())
+        expired = self.signed_with(
+            self.OLD_SECRET, 0, name="exp", at=time.time() - 32 * 86400
+        )
+        handler._cookies["exp"] = expired
+        handler._cookies["bad"] = b"garbage"
+        self.assertIsNone(handler.get_signed_cookie("exp", refresh=True))
+        self.assertIsNone(handler.get_signed_cookie("bad", refresh=True))
+        self.assertEqual(handler._cookies["exp"], expired)
+        self.assertEqual(handler._cookies["bad"], b"garbage")
+
+    def test_handler_refresh_after_rotation_uses_new_current_key(self):
+        # A real-time secret: key 1 current, key 0 retired 100s ago.
+        now = time.time()
+        secret = RotatingCookieSecret(
+            [(1, self.NEW_SECRET), (0, self.OLD_SECRET, now - 100)],
+            rotation_window_days=1,
+        )
+        old = self.signed_with(self.OLD_SECRET, 0, at=now)
+        jar = {"foo": old}
+
+        first = self.handler(secret)
+        first._cookies = jar
+        self.assertEqual(first.get_signed_cookie("foo", refresh=True), b"bar")
+        self.assertEqual(get_signature_key_version(jar["foo"]), 1)
+
+        # Rotate to key 2; the already-refreshed cookie gets upgraded
+        # (compare-and-swap permits newer versions, never older ones).
+        secret.rotate(2, "third-secret")
+        second = self.handler(secret)
+        second._cookies = jar
+        self.assertEqual(second.get_signed_cookie("foo", refresh=True), b"bar")
+        self.assertEqual(get_signature_key_version(jar["foo"]), 2)
+
+    def test_handler_refreshed_cookie_rejected_after_window(self):
+        # Key 0 retired two days ago, window of one day: old cookies are
+        # rejected like ordinary invalid cookies and nothing is written.
+        now = time.time()
+        secret = RotatingCookieSecret(
+            [(1, self.NEW_SECRET), (0, self.OLD_SECRET, now - 2 * 86400)],
+            rotation_window_days=1,
+        )
+        old = self.signed_with(self.OLD_SECRET, 0, at=now - 2 * 86400 + 60)
+        jar = {"foo": old}
+        handler = self.handler(secret)
+        handler._cookies = jar
+        self.assertIsNone(handler.get_signed_cookie("foo", refresh=True))
+        self.assertEqual(jar["foo"], old)
+
+    def test_handler_plain_dict_keys_remain_valid_without_old_state(self):
+        # Backwards compatibility: plain secret dicts have no window and
+        # non-current keys are simply VALID.
+        keys = {0: self.OLD_SECRET, 1: self.NEW_SECRET}
+        handler = CookieTestRequestHandler(
+            cookie_secret=keys, key_version=1
+        )
+        handler._cookies["foo"] = self.signed_with(
+            self.OLD_SECRET, 0, at=time.time()
+        )
+        result = handler.verify_signed_cookie("foo")
+        self.assertEqual(result.status, SignedCookieStatus.VALID)
+        self.assertEqual(handler.get_signed_cookie("foo"), b"bar")
+
+    # ---- concurrency ----
+
+    def test_concurrent_refreshes_never_write_an_old_version(self):
+        now = time.time()
+        secret = RotatingCookieSecret(
+            [(1, self.NEW_SECRET), (0, self.OLD_SECRET, now - 100)],
+            rotation_window_days=1,
+        )
+        old = self.signed_with(self.OLD_SECRET, 0, at=now)
+        errors: list[BaseException] = []
+
+        for _ in range(10):
+            jar = {"foo": old}
+            barrier = threading.Barrier(8)
+
+            def worker() -> None:
+                try:
+                    barrier.wait()
+                    handler = self.handler(secret)
+                    handler._cookies = jar
+                    self.assertEqual(
+                        handler.get_signed_cookie("foo", refresh=True),
+                        b"bar",
+                    )
+                    # At no point may the shared cookie regress to key 0.
+                    self.assertNotEqual(
+                        get_signature_key_version(jar["foo"]), 0
+                    )
+                except BaseException as e:  # report from the thread
+                    errors.append(e)
+
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            # The final cookie is signed with the current key.
+            self.assertEqual(get_signature_key_version(jar["foo"]), 1)
+            self.assertEqual(
+                verify_signed_value(secret, "foo", jar["foo"]).status,
+                SignedCookieStatus.VALID,
+            )
+
+    def test_concurrent_refresh_vs_rotation(self):
+        now = time.time()
+        secret = RotatingCookieSecret(
+            [(1, self.NEW_SECRET), (0, self.OLD_SECRET, now - 100)],
+            rotation_window_days=1,
+        )
+        old = self.signed_with(self.OLD_SECRET, 0, at=now)
+        jar = {"foo": old}
+        n_workers = 12
+        barrier = threading.Barrier(n_workers + 1)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                handler = self.handler(secret)
+                handler._cookies = jar
+                self.assertEqual(
+                    handler.get_signed_cookie("foo", refresh=True), b"bar"
+                )
+                marker = get_signature_key_version(jar["foo"])
+                # Never the original (old) key version.
+                self.assertGreaterEqual(marker, 1)
+            except BaseException as e:  # report from the thread
+                errors.append(e)
+
+        def rotator() -> None:
+            try:
+                barrier.wait()
+                time.sleep(0.001)
+                secret.rotate(2, "third-secret")
+            except BaseException as e:  # report from the thread
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(n_workers)]
+        threads.append(threading.Thread(target=rotator))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        marker = get_signature_key_version(jar["foo"])
+        self.assertGreaterEqual(marker, 1)
+        # Whatever wins, the outgoing cookie must be acceptable under the
+        # post-rotation configuration and not an old-key write-back.
+        result = verify_signed_value(secret, "foo", jar["foo"])
+        self.assertIn(
+            result.status,
+            (SignedCookieStatus.VALID, SignedCookieStatus.OLD_KEY),
+        )
+        self.assertEqual(result.value, b"bar")
 
 
 class FinalReturnTest(WebTestCase):
