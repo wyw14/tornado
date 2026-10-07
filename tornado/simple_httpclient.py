@@ -71,6 +71,32 @@ class HTTPStreamClosedError(HTTPError):
         return self.message or "Stream closed"
 
 
+def _request_host_key(request: HTTPRequest) -> tuple[str, int] | None:
+    """Return the ``(host, port)`` the request will connect to.
+
+    This mirrors the URL parsing done in `_HTTPConnection.run` and is used
+    to enforce per-host concurrency quotas. Returns None when the target host
+    cannot be determined from the URL (such requests fail when started, but
+    queue scheduling must not break on them).
+    """
+    try:
+        parsed = urllib.parse.urlsplit(_unicode(request.url))
+        netloc = parsed.netloc
+        if "@" in netloc:
+            _, _, netloc = netloc.rpartition("@")
+        host, port = httputil.split_host_and_port(netloc)
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if re.match(r"^\[.*\]$", host):
+        # raw ipv6 addresses in urls are enclosed in brackets
+        host = host[1:-1]
+    return (host.lower(), port)
+
+
 class SimpleAsyncHTTPClient(AsyncHTTPClient):
     """Non-blocking HTTP client with no external dependencies.
 
@@ -88,6 +114,17 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
     in progress; when this limit is reached additional requests will be
     queued. Note that time spent waiting in this queue still counts
     against the ``request_timeout``.
+
+    ``max_host_clients``, if set to a positive integer, additionally limits
+    the number of concurrent requests in progress to any single host, where a
+    host is identified by hostname and port. This prevents requests to one
+    slow host from filling the entire ``max_clients`` quota: requests to a
+    host that has reached its quota stay queued while requests to other hosts
+    proceed as long as the global limit allows. When a request releases a
+    host slot, queued requests to other runnable hosts are started before
+    additional requests to the host that released the slot. The default of
+    None means there is no per-host limit and requests are scheduled by the
+    global queue alone.
 
     ``defaults`` is a dict of parameters that will be used as defaults on all
     `.HTTPRequest` objects submitted to this client.
@@ -108,6 +145,9 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
 
     .. versionchanged:: 4.2
         Added the ``max_body_size`` argument.
+
+    .. versionadded:: 6.6
+        Added the ``max_host_clients`` argument.
     """
 
     def initialize(  # type: ignore
@@ -119,15 +159,29 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         defaults: dict[str, Any] | None = None,
         max_header_size: int | None = None,
         max_body_size: int | None = None,
+        max_host_clients: int | None = None,
     ) -> None:
         super().initialize(defaults=defaults)
         self.max_clients = max_clients
+        self.max_host_clients = max_host_clients
         self.queue: collections.deque[
-            tuple[object, HTTPRequest, Callable[[HTTPResponse], None]]
+            tuple[
+                object,
+                HTTPRequest,
+                Callable[[HTTPResponse], None],
+                tuple[str, int] | None,
+            ]
         ] = collections.deque()
         self.active: dict[
             object, tuple[HTTPRequest, Callable[[HTTPResponse], None]]
         ] = {}
+        # Only used when max_host_clients is set: active_hosts maps the key
+        # of each active request to its target host (None if the host could
+        # not be determined), and active_by_host counts active requests per
+        # host. A request only appears here once it has actually acquired a
+        # slot, so queued timeouts/cancellations release nothing.
+        self.active_hosts: dict[object, tuple[str, int] | None] = {}
+        self.active_by_host: dict[tuple[str, int], int] = {}
         self.waiting: dict[
             object, tuple[HTTPRequest, Callable[[HTTPResponse], None], object]
         ] = {}
@@ -158,11 +212,22 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         self, request: HTTPRequest, callback: Callable[[HTTPResponse], None]
     ) -> None:
         key = object()
-        self.queue.append((key, request, callback))
+        # Only resolve the host when per-host quotas are enabled, so that
+        # scheduling without max_host_clients behaves exactly as before.
+        max_host_clients = self.max_host_clients
+        host = (
+            _request_host_key(request) if max_host_clients is not None else None
+        )
+        self.queue.append((key, request, callback, host))
         assert request.connect_timeout is not None
         assert request.request_timeout is not None
         timeout_handle = None
-        if len(self.active) >= self.max_clients:
+        host_limit_reached = (
+            max_host_clients is not None
+            and host is not None
+            and self.active_by_host.get(host, 0) >= max_host_clients
+        )
+        if len(self.active) >= self.max_clients or host_limit_reached:
             timeout = (
                 min(request.connect_timeout, request.request_timeout)
                 or request.connect_timeout
@@ -181,15 +246,86 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
                 "%d active, %d queued requests." % (len(self.active), len(self.queue))
             )
 
-    def _process_queue(self) -> None:
+    def _process_queue(
+        self, released_host: tuple[str, int] | None = None
+    ) -> None:
+        if self.max_host_clients is None:
+            # No per-host quotas: strict FIFO scheduling under the global
+            # limit, matching the behavior before max_host_clients existed.
+            while self.queue and len(self.active) < self.max_clients:
+                key, request, callback, host = self.queue.popleft()
+                if key not in self.waiting:
+                    continue
+                self._activate(key, request, callback, host)
+            return
+
         while self.queue and len(self.active) < self.max_clients:
-            key, request, callback = self.queue.popleft()
+            index, _host = self._find_runnable(released_host)
+            if index < 0:
+                # No queued request can run right now: either the global
+                # limit is the bottleneck (handled by the while condition)
+                # or every queued host is at its per-host quota.
+                return
+            key, request, callback, host = self.queue[index]
+            del self.queue[index]
             if key not in self.waiting:
+                # Stale entry (timed out or canceled while queued). It never
+                # held a slot, so just drop it and keep looking.
                 continue
-            self._remove_timeout(key)
-            self.active[key] = (request, callback)
-            release_callback = functools.partial(self._release_fetch, key)
-            self._handle_request(request, release_callback, callback)
+            self._activate(key, request, callback, host)
+
+    def _find_runnable(
+        self, released_host: tuple[str, int] | None
+    ) -> tuple[int, tuple[str, int] | None]:
+        """Find the next queued request that can acquire a slot.
+
+        Entries whose host is at its ``max_host_clients`` quota are skipped
+        in place so that other hosts can advance past them. When
+        ``released_host`` is given (a slot for that host just freed),
+        runnable entries for *other* hosts are preferred; entries for the
+        released host are only used if no other host can run.
+
+        Stale entries (whose key is no longer in ``waiting``) are returned
+        so the caller can drop them. Returns (-1, None) when nothing can run.
+        """
+        max_host_clients = self.max_host_clients
+        assert max_host_clients is not None
+        same_host_index = -1
+        for index, (key, _, _, host) in enumerate(self.queue):
+            if key not in self.waiting:
+                return index, host
+            if (
+                host is not None
+                and self.active_by_host.get(host, 0) >= max_host_clients
+            ):
+                # This host's quota is full; leave the entry queued and
+                # look for another runnable host.
+                continue
+            if released_host is not None and host == released_host:
+                if same_host_index < 0:
+                    same_host_index = index
+                continue
+            return index, host
+        if same_host_index >= 0:
+            return same_host_index, released_host
+        return -1, None
+
+    def _activate(
+        self,
+        key: object,
+        request: HTTPRequest,
+        callback: Callable[[HTTPResponse], None],
+        host: tuple[str, int] | None,
+    ) -> None:
+        """Move a queued request into the active set and start it."""
+        self._remove_timeout(key)
+        self.active[key] = (request, callback)
+        if self.max_host_clients is not None:
+            self.active_hosts[key] = host
+            if host is not None:
+                self.active_by_host[host] = self.active_by_host.get(host, 0) + 1
+        release_callback = functools.partial(self._release_fetch, key)
+        self._handle_request(request, release_callback, callback)
 
     def _connection_class(self) -> type:
         return _HTTPConnection
@@ -213,7 +349,20 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
 
     def _release_fetch(self, key: object) -> None:
         del self.active[key]
-        self._process_queue()
+        released_host = None
+        if self.max_host_clients is not None:
+            # Release only the host quota this request actually acquired.
+            # active_hosts always has an entry here, but its host may be
+            # None (requests whose host could not be determined were only
+            # counted against the global limit).
+            released_host = self.active_hosts.pop(key)
+            if released_host is not None:
+                host_count = self.active_by_host[released_host] - 1
+                if host_count:
+                    self.active_by_host[released_host] = host_count
+                else:
+                    del self.active_by_host[released_host]
+        self._process_queue(released_host)
 
     def _remove_timeout(self, key: object) -> None:
         if key in self.waiting:
@@ -231,7 +380,12 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         :info string key: More detailed timeout information.
         """
         request, callback, timeout_handle = self.waiting[key]
-        self.queue.remove((key, request, callback))
+        # A timed-out queued request never acquired a global or per-host
+        # slot, so it must only be removed from the queue; nothing to release.
+        for index, (queued_key, _, _, _) in enumerate(self.queue):
+            if queued_key is key:
+                del self.queue[index]
+                break
 
         error_message = f"Timeout {info}" if info else "Timeout"
         timeout_response = HTTPResponse(

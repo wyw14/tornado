@@ -255,6 +255,147 @@ class SimpleHTTPClientTestMixin(AsyncTestCase):
             response = yield client.fetch(self.get_url("/countdown/3"), max_redirects=3)
             response.rethrow()
 
+    def test_host_connection_limit(self):
+        # Per-host quotas let other hosts bypass a host whose quota is full,
+        # and a released host slot is given to other runnable hosts before
+        # the released host refills.
+        port = self.get_http_port()
+        protocol = self.get_protocol()
+        mapping = {
+            "slow.example.com": "127.0.0.1",
+            "fast.example.com": "127.0.0.1",
+        }
+        with closing(
+            self.create_client(
+                max_clients=3,
+                max_host_clients=2,
+                hostname_mapping=mapping,
+            )
+        ) as client:
+            slow_key = ("slow.example.com", port)
+            fast_key = ("fast.example.com", port)
+            slow_url = "%s://slow.example.com:%d/trigger" % (protocol, port)
+            fast_url = "%s://fast.example.com:%d/trigger" % (protocol, port)
+            done = []
+
+            def fetch(url, label):
+                fut = client.fetch(url, request_timeout=30)
+
+                def cb(fut):
+                    done.append(label)
+                    self.stop()
+
+                fut.add_done_callback(cb)
+                return fut
+
+            # Three slow-host requests: two are active, one is queued
+            # because the host quota is full.
+            fetch(slow_url, "s1")
+            fetch(slow_url, "s2")
+            fetch(slow_url, "s3")
+            self.wait(condition=lambda: len(self.triggers) == 2)
+            self.assertEqual(len(client.active), 2)
+            self.assertEqual(len(client.queue), 1)
+            self.assertEqual(client.active_by_host, {slow_key: 2})
+
+            # The fast host is not blocked by the queued slow request:
+            # it takes a global slot immediately.
+            fetch(fast_url, "f1")
+            self.wait(condition=lambda: len(self.triggers) == 3)
+            self.assertEqual(len(client.active), 3)
+            self.assertEqual(len(client.queue), 1)
+            self.assertEqual(client.active_by_host, {slow_key: 2, fast_key: 1})
+
+            # The second fast-host request is queued (global limit reached).
+            fetch(fast_url, "f2")
+            self.assertEqual(len(client.queue), 2)
+
+            # Releasing a slow slot advances the other runnable host (f2)
+            # before the slow host gets refilled (s3).
+            self.triggers.popleft()()  # s1 finishes
+            self.wait(condition=lambda: len(self.triggers) == 3)
+            self.assertEqual(client.active_by_host, {slow_key: 1, fast_key: 2})
+            self.assertEqual(len(client.queue), 1)
+            self.assertEqual(done, ["s1"])
+
+            # s2 and both fast requests finish, which lets s3 start.
+            self.triggers.popleft()()
+            self.triggers.popleft()()
+            self.triggers.popleft()()
+            self.wait(condition=lambda: len(self.triggers) == 1)
+            self.triggers.popleft()()
+            self.wait(condition=lambda: len(done) == 5)
+            self.assertEqual(set(done), {"s1", "s2", "s3", "f1", "f2"})
+            self.assertEqual(len(client.active), 0)
+            self.assertEqual(len(client.queue), 0)
+            self.assertEqual(client.active_by_host, {})
+
+    def test_host_queue_timeout(self):
+        # A request queued because its host quota is full (while global
+        # slots are free) times out in the queue without acquiring any
+        # slot, so the active request keeps both its global and host slots.
+        port = self.get_http_port()
+        protocol = self.get_protocol()
+        mapping = {"slow.example.com": "127.0.0.1"}
+        with closing(
+            self.create_client(
+                max_clients=10,
+                max_host_clients=1,
+                hostname_mapping=mapping,
+            )
+        ) as client:
+            slow_key = ("slow.example.com", port)
+            fut1 = client.fetch(
+                "%s://slow.example.com:%d/trigger" % (protocol, port),
+                request_timeout=30,
+            )
+            self.wait(condition=lambda: len(self.triggers) == 1)
+            with self.assertRaises(HTTPTimeoutError) as cm:
+                self.io_loop.run_sync(
+                    lambda: client.fetch(
+                        "%s://slow.example.com:%d/hello" % (protocol, port),
+                        connect_timeout=0.1,
+                        raise_error=True,
+                    )
+                )
+            self.assertEqual(str(cm.exception), "Timeout in request queue")
+            self.assertEqual(len(client.active), 1)
+            self.assertEqual(len(client.queue), 0)
+            self.assertEqual(client.active_by_host, {slow_key: 1})
+
+            self.triggers.popleft()()
+            self.io_loop.run_sync(lambda: fut1)
+            self.assertEqual(len(client.active), 0)
+            self.assertEqual(client.active_by_host, {})
+
+    def test_host_limit_connection_failure(self):
+        # A failed connection must release the host as well as the global
+        # slot so the next queued request to the same host can run.
+        cleanup_func, port = refusing_port()
+        self.addCleanup(cleanup_func)
+        with ExpectLog(gen_log, ".*", required=False):
+            with closing(
+                self.create_client(max_clients=2, max_host_clients=1)
+            ) as client:
+                url = "http://127.0.0.1:%d/" % port
+
+                async def fetch_both():
+                    f1 = client.fetch(url)
+                    f2 = client.fetch(url)
+                    errors = []
+                    for f in (f1, f2):
+                        try:
+                            await f
+                        except socket.error as e:
+                            errors.append(e)
+                    return errors
+
+                errors = self.io_loop.run_sync(fetch_both)
+        self.assertEqual(len(errors), 2)
+        self.assertEqual(len(client.active), 0)
+        self.assertEqual(len(client.queue), 0)
+        self.assertEqual(client.active_by_host, {})
+
     def test_max_redirects(self):
         response = self.fetch("/countdown/5", max_redirects=3)
         self.assertEqual(302, response.code)
@@ -646,6 +787,18 @@ class CreateAsyncHTTPClientTestCase(AsyncTestCase):
             self.assertEqual(client.max_clients, 13)  # type: ignore
         with closing(AsyncHTTPClient(max_clients=14, force_instance=True)) as client:
             self.assertEqual(client.max_clients, 14)  # type: ignore
+
+    def test_max_host_clients(self):
+        AsyncHTTPClient.configure(SimpleAsyncHTTPClient)
+        with closing(AsyncHTTPClient(force_instance=True)) as client:
+            self.assertIsNone(client.max_host_clients)  # type: ignore
+        with closing(
+            AsyncHTTPClient(max_host_clients=3, force_instance=True)
+        ) as client:
+            self.assertEqual(client.max_host_clients, 3)  # type: ignore
+        AsyncHTTPClient.configure(SimpleAsyncHTTPClient, max_host_clients=4)
+        with closing(AsyncHTTPClient(force_instance=True)) as client:
+            self.assertEqual(client.max_host_clients, 4)  # type: ignore
 
 
 class HTTP100ContinueTestCase(AsyncHTTPTestCase):
