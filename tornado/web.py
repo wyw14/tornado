@@ -56,6 +56,7 @@ the executor do not refer to Tornado objects.
 
 """
 
+import asyncio
 import base64
 import binascii
 import datetime
@@ -206,6 +207,7 @@ class RequestHandler:
         self._headers_written = False
         self._finished = False
         self._auto_finish = True
+        self._connection_closed = False
         self._prepared_future = None
         self.ui = ObjectDict(
             (n, self._ui_method(m)) for n, m in application.ui_methods.items()
@@ -221,7 +223,7 @@ class RequestHandler:
         assert self.request.connection is not None
         # TODO: need to add set_close_callback to HTTPConnection interface
         self.request.connection.set_close_callback(  # type: ignore
-            self.on_connection_close
+            self._on_connection_close
         )
         self.initialize(**kwargs)  # type: ignore
 
@@ -294,6 +296,14 @@ class RequestHandler:
         to the client.
         """
         pass
+
+    def _on_connection_close(self) -> None:
+        # Internal entry point registered with the HTTP connection. Record
+        # the close at the framework level (so _execute can avoid starting
+        # the formal handler after a disconnect during prepare) and then run
+        # the user-overridable hook.
+        self._connection_closed = True
+        self.on_connection_close()
 
     def on_connection_close(self) -> None:
         """Called in async handlers if the client closed the connection.
@@ -1846,7 +1856,18 @@ class RequestHandler:
                 # Tell the Application we've finished with prepare()
                 # and are ready for the body to arrive.
                 future_set_result_unless_cancelled(self._prepared_future, None)
+            # prepare() has three mutually exclusive outcomes and each one
+            # commits the response at most once:
+            # 1. prepare() finished the response itself (e.g. send_error or
+            #    redirect); do not run the formal handler or error handling.
+            # 2. prepare() raised (handled in the except clause below).
+            # 3. prepare() succeeded; proceed to the formal handler.
             if self._finished:
+                return
+            if self._connection_closed:
+                # The client went away while prepare() was still running, so
+                # there is nowhere to send a response. Do not start the
+                # formal handler; just release request-level state below.
                 return
 
             if _has_stream_request_body(self.__class__):
@@ -1865,7 +1886,25 @@ class RequestHandler:
                 result = await result
             if self._auto_finish and not self._finished:
                 self.finish()
-        except Exception as e:
+        except (Exception, asyncio.CancelledError) as e:
+            task = asyncio.current_task()
+            if (
+                isinstance(e, asyncio.CancelledError)
+                and task is not None
+                and task.cancelling()
+            ):
+                # This handler's own task was cancelled (as opposed to the
+                # handler awaiting something else that was cancelled). This
+                # is not an error to be logged, but send a response so the
+                # connection is not left hanging, then let the cancellation
+                # propagate.
+                result = None
+                if not self._finished:
+                    try:
+                        self.send_error(500)
+                    except Exception:
+                        app_log.error("Exception in exception handler", exc_info=True)
+                raise
             try:
                 self._handle_request_exception(e)
             except Exception:
@@ -1873,11 +1912,19 @@ class RequestHandler:
             finally:
                 # Unset result to avoid circular references
                 result = None
+        finally:
             if self._prepared_future is not None and not self._prepared_future.done():
                 # In case we failed before setting _prepared_future, do it
-                # now (to unblock the HTTP server).  Note that this is not
-                # in a finally block to avoid GC issues prior to Python 3.4.
+                # now (to unblock the HTTP server).
                 self._prepared_future.set_result(None)
+            # Release per-request connection state once the request has
+            # reached a terminal state. Leave the close callback in place
+            # if a response is still pending on an open connection (e.g.
+            # handlers with self._auto_finish = False).
+            if (
+                self._finished or self._connection_closed
+            ) and self.request.connection is not None:
+                self.request.connection.set_close_callback(None)  # type: ignore
 
     def data_received(self, chunk: bytes) -> Awaitable[None] | None:
         """Implement this method to handle streamed request data.
@@ -2510,7 +2557,10 @@ class _HandlerDelegate(httputil.HTTPMessageDelegate):
         fut = gen.convert_yielded(
             self.handler._execute(transforms, *self.path_args, **self.path_kwargs)
         )
-        fut.add_done_callback(lambda f: f.result())
+        # A handler whose own task was cancelled re-raises the
+        # CancelledError from _execute; don't log that as an uncaught
+        # exception in the callback.
+        fut.add_done_callback(lambda f: f.cancelled() or f.result())
         # If we are streaming the request body, then execute() is finished
         # when the handler has prepared to receive the body.  If not,
         # it doesn't matter when execute() finishes (so we return None)

@@ -1,3 +1,4 @@
+import asyncio
 import binascii
 import contextlib
 import copy
@@ -2361,6 +2362,180 @@ class FinishInPrepareTest(SimpleHandlerTestCase):
     def test_finish_in_prepare(self):
         response = self.fetch("/")
         self.assertEqual(response.body, b"done")
+
+
+class PrepareLifecycleTest(WebTestCase):
+    """Tests for the three possible outcomes of ``prepare()``: success,
+    a response committed by prepare itself, and an exception.
+
+    Each path commits the response exactly once, and a client disconnect
+    before prepare finishes prevents the formal handler from running.
+    """
+
+    def get_handlers(self):
+        test = self
+
+        class CountingHandler(RequestHandler):
+            def initialize(self):
+                test.calls = []
+
+            async def prepare(self):
+                test.calls.append("prepare")
+
+            async def get(self):
+                test.calls.append("get")
+                self.write("ok")
+
+        class SendErrorInPrepareHandler(CountingHandler):
+            async def prepare(self):
+                await super().prepare()
+                self.send_error(403)
+
+        class RaiseInPrepareHandler(CountingHandler):
+            async def prepare(self):
+                await super().prepare()
+                raise HTTPError(402)
+
+        class SendErrorThenRaiseHandler(CountingHandler):
+            async def prepare(self):
+                await super().prepare()
+                self.send_error(403)
+                await gen.sleep(0)
+                raise ValueError("raised after the response was committed")
+
+        class FlushThenRaiseInPrepareHandler(CountingHandler):
+            async def prepare(self):
+                await super().prepare()
+                # Commit the status line, then fail before finish().
+                self.flush()
+                raise HTTPError(403)
+
+        class CloseDuringPrepareHandler(RequestHandler):
+            def initialize(self):
+                pass
+
+            async def prepare(self):
+                test.prepare_started.set_result(None)
+                await test.prepare_event.wait()
+
+            def get(self):
+                test.handler_called = True
+                self.write("ok")
+
+            def on_connection_close(self):
+                super().on_connection_close()
+                test.close_future.set_result(None)
+
+        class PendingResponseHandler(RequestHandler):
+            def initialize(self):
+                pass
+
+            def get(self):
+                # Legacy pattern: return without finishing and complete the
+                # response later, outside of _execute.
+                self._auto_finish = False
+                test.pending_handler = self
+                test.method_returned.set_result(None)
+
+            def on_connection_close(self):
+                super().on_connection_close()
+                test.pending_close.set_result(None)
+
+        return [
+            url("/success", CountingHandler),
+            url("/send_error", SendErrorInPrepareHandler),
+            url("/raise", RaiseInPrepareHandler),
+            url("/send_error_then_raise", SendErrorThenRaiseHandler),
+            url("/flush_then_raise", FlushThenRaiseInPrepareHandler),
+            url("/close", CloseDuringPrepareHandler),
+            url("/pending", PendingResponseHandler),
+        ]
+
+    def test_success_runs_handler_once(self):
+        response = self.fetch("/success")
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"ok")
+        self.assertEqual(self.calls, ["prepare", "get"])
+
+    def test_error_response_in_prepare_commits_once(self):
+        response = self.fetch("/send_error")
+        self.assertEqual(response.code, 403)
+        # prepare committed the response; the formal handler never ran.
+        self.assertEqual(self.calls, ["prepare"])
+
+    def test_exception_in_prepare_commits_once(self):
+        response = self.fetch("/raise")
+        self.assertEqual(response.code, 402)
+        # An exception from prepare goes through error handling only; the
+        # formal handler never ran.
+        self.assertEqual(self.calls, ["prepare"])
+
+    def test_exception_after_committed_response_does_not_recommit(self):
+        # prepare() sends its error and then raises: the later exception must
+        # not produce a second response or change the committed status.
+        with ExpectLog(app_log, "Uncaught exception"):
+            response = self.fetch("/send_error_then_raise")
+        self.assertEqual(response.code, 403)
+        self.assertEqual(self.calls, ["prepare"])
+
+    def test_exception_after_flush_keeps_committed_status(self):
+        # Once headers have been sent, a later exception cannot select a
+        # different status code (and the partial response is finished).
+        with ExpectLog(
+            gen_log,
+            "(Cannot send error response after headers written"
+            "|Failed to flush partial response)",
+        ):
+            response = self.fetch("/flush_then_raise")
+        self.assertEqual(response.code, 200)
+        self.assertEqual(self.calls, ["prepare"])
+
+    @gen_test
+    async def test_disconnect_during_prepare_skips_handler(self):
+        self.prepare_started: Future[None] = Future()
+        self.prepare_event = Event()
+        self.close_future: Future[None] = Future()
+        self.handler_called = False
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+        s.connect(("127.0.0.1", self.get_http_port()))
+        stream = IOStream(s)
+        try:
+            stream.write(b"GET /close HTTP/1.0\r\n\r\n")
+            await self.prepare_started
+            # The client goes away while prepare() is still waiting.
+            stream.close()
+            await self.close_future
+            # Let prepare finish and _execute resume before checking.
+            self.prepare_event.set()
+            await gen.sleep(0.1)
+            self.assertFalse(
+                self.handler_called,
+                "formal handler ran after client disconnected during prepare",
+            )
+        finally:
+            stream.close()
+
+    @gen_test
+    async def test_pending_response_keeps_close_callback(self):
+        self.method_returned: Future[None] = Future()
+        self.pending_handler = None
+        self.pending_close: Future[None] = Future()
+
+        response_future = self.http_client.fetch(
+            self.get_url("/pending"), request_timeout=2.0, raise_error=False
+        )
+        await self.method_returned
+        handler = self.pending_handler
+        assert handler is not None
+        # _execute has returned while the response is still pending, so
+        # the request-level close callback must remain registered.
+        self.assertIsNotNone(handler.request.connection._close_callback)
+        # The response can still be completed later as usual.
+        handler.finish("later")
+        response = await response_future
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"later")
 
 
 class Default404Test(WebTestCase):
