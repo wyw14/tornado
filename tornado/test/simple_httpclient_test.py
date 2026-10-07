@@ -9,15 +9,15 @@ import sys
 import typing
 from contextlib import closing
 
-from tornado import gen, version
+from tornado import gen, netutil, version
 from tornado.escape import to_unicode, utf8
-from tornado.httpclient import AsyncHTTPClient, HTTPResponse
+from tornado.httpclient import AsyncHTTPClient, HTTPResponse, HTTPStreamAbort
 from tornado.httpserver import HTTPServer
 from tornado.httputil import HTTPHeaders, ResponseStartLine
 from tornado.ioloop import IOLoop
-from tornado.iostream import UnsatisfiableReadError
+from tornado.iostream import IOStream, UnsatisfiableReadError
 from tornado.locks import Event
-from tornado.log import gen_log
+from tornado.log import app_log, gen_log
 from tornado.netutil import Resolver, bind_sockets
 from tornado.simple_httpclient import (
     HTTPStreamClosedError,
@@ -42,6 +42,7 @@ from tornado.testing import (
     AsyncHTTPTestCase,
     AsyncTestCase,
     ExpectLog,
+    bind_unused_port,
     gen_test,
 )
 from tornado.web import Application, RequestHandler, stream_request_body, url
@@ -147,6 +148,14 @@ class RespondInPrepareHandler(RequestHandler):
         self.finish("forbidden")
 
 
+class LargeGzipHandler(RequestHandler):
+    def get(self):
+        # A large, highly-compressible body (gzip is enabled for this
+        # application), for exercising early aborts through the gzip
+        # decoding delegate.
+        self.write(b"Hello world! " * 5000)
+
+
 @abstract_base_test
 class SimpleHTTPClientTestMixin(AsyncTestCase):
     # See comments on TestIOStreamWebMixin
@@ -196,6 +205,7 @@ class SimpleHTTPClientTestMixin(AsyncTestCase):
                 url("/respond_in_prepare", RespondInPrepareHandler),
                 url("/redirect", RedirectHandler),
                 url("/user_agent", UserAgentHandler),
+                url("/large", LargeGzipHandler),
             ],
             gzip=True,
         )
@@ -557,6 +567,154 @@ class SimpleHTTPClientTestMixin(AsyncTestCase):
         # Make sure we only got one set of headers.
         num_start_lines = len([h for h in headers if h.startswith("HTTP/")])
         self.assertEqual(num_start_lines, 1)
+
+    def test_streaming_abort(self):
+        # Raising HTTPStreamAbort from a streaming_callback stops reading
+        # the response early without turning it into an error. Only the
+        # chunks delivered before the abort are seen.
+        chunks: list[bytes] = []
+
+        def streaming_callback(chunk: bytes) -> None:
+            chunks.append(chunk)
+            raise HTTPStreamAbort()
+
+        with ExpectLog(app_log, ".*", required=False):
+            response = self.fetch("/chunk", streaming_callback=streaming_callback)
+        self.assertEqual(response.code, 200)
+        self.assertIsNone(response.error)
+        self.assertEqual(chunks, [b"asdf"])
+        # As usual with streaming_callback, the body is not buffered.
+        self.assertEqual(response.body, b"")
+
+    def test_streaming_abort_coroutine(self):
+        # HTTPStreamAbort may also be raised from an asynchronous
+        # streaming_callback.
+        import asyncio
+
+        chunks: list[bytes] = []
+
+        async def streaming_callback(chunk: bytes) -> None:
+            await asyncio.sleep(0)
+            chunks.append(chunk)
+            raise HTTPStreamAbort()
+
+        with ExpectLog(app_log, ".*", required=False):
+            response = self.fetch("/chunk", streaming_callback=streaming_callback)
+        self.assertEqual(response.code, 200)
+        self.assertIsNone(response.error)
+        self.assertEqual(chunks, [b"asdf"])
+
+    def test_header_callback_abort(self):
+        # Raising HTTPStreamAbort from a header_callback lets a caller
+        # that only wants the headers skip the body entirely.
+        chunks: list[bytes] = []
+
+        def header_callback(header_line: str) -> None:
+            if header_line == "\r\n":
+                raise HTTPStreamAbort()
+
+        with ExpectLog(app_log, ".*", required=False):
+            response = self.fetch(
+                "/chunk",
+                header_callback=header_callback,
+                streaming_callback=chunks.append,
+            )
+        self.assertEqual(response.code, 200)
+        self.assertIsNone(response.error)
+        self.assertEqual(response.headers.get("Transfer-Encoding"), "chunked")
+        self.assertEqual(chunks, [])
+
+    def test_streaming_abort_preserves_status(self):
+        # The status code sent by the server is preserved when reading is
+        # aborted early; it is not reported as a 599 error.
+        def streaming_callback(chunk: bytes) -> None:
+            raise HTTPStreamAbort()
+
+        response = self.fetch(
+            "/does_not_exist", streaming_callback=streaming_callback
+        )
+        self.assertEqual(response.code, 404)
+        self.assertIsNotNone(response.error)
+        self.assertEqual(response.error.code, 404)
+
+    def test_streaming_abort_gzip(self):
+        # Early abort works through the gzip-decoding delegate (enabled by
+        # default): decompressed chunks are delivered, the decompressor's
+        # truncated-stream check is not tripped, and the response succeeds.
+        chunks: list[bytes] = []
+
+        def streaming_callback(chunk: bytes) -> None:
+            chunks.append(chunk)
+            raise HTTPStreamAbort()
+
+        response = self.fetch("/large", streaming_callback=streaming_callback)
+        self.assertEqual(response.code, 200)
+        self.assertIsNone(response.error)
+        self.assertTrue(chunks)
+        self.assertTrue(chunks[0].startswith(b"Hello world!"))
+
+    def test_streaming_callback_error(self):
+        # Any other exception raised by a streaming_callback fails the
+        # request, carrying the original exception. This is distinct from
+        # both a deliberate HTTPStreamAbort (successful partial response)
+        # and the server closing the connection (HTTPStreamClosedError).
+        def streaming_callback(chunk: bytes) -> None:
+            raise ValueError("boom")
+
+        with ExpectLog(app_log, "Uncaught exception"):
+            with self.assertRaises(ValueError) as cm:
+                self.fetch("/chunk", streaming_callback=streaming_callback)
+        self.assertEqual(str(cm.exception), "boom")
+
+    def test_fetch_after_streaming_abort(self):
+        # The unread remainder of an aborted response must not affect any
+        # later request (the aborted connection is closed rather than
+        # reused).
+        def streaming_callback(chunk: bytes) -> None:
+            raise HTTPStreamAbort()
+
+        with ExpectLog(app_log, ".*", required=False):
+            aborted = self.fetch("/chunk", streaming_callback=streaming_callback)
+        self.assertEqual(aborted.code, 200)
+
+        response = self.fetch("/hello")
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"Hello world!")
+
+    def test_server_closes_early_streaming(self):
+        # If the server closes the connection before the advertised body
+        # has been sent, the result is a 599 HTTPStreamClosedError even
+        # though a streaming_callback got some data. This is distinct from
+        # aborting the read deliberately.
+        sock, port = bind_unused_port()
+        with closing(sock):
+
+            @gen.coroutine
+            def accept_callback(conn, address):
+                stream = IOStream(conn)
+                yield stream.read_until(b"\r\n\r\n")
+                # Claim a 100-byte body but send only 5 before closing.
+                try:
+                    yield stream.write(
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Length: 100\r\n\r\n" + b"x" * 5
+                    )
+                finally:
+                    stream.close()
+
+            netutil.add_accept_handler(sock, accept_callback)  # type: ignore
+            try:
+                chunks: list[bytes] = []
+                with self.assertRaises(HTTPStreamClosedError):
+                    self.fetch(
+                        "http://127.0.0.1:%d/" % port,
+                        streaming_callback=chunks.append,
+                    )
+            finally:
+                self.io_loop.remove_handler(sock.fileno())
+        # The chunk that did arrive was delivered, but the truncated
+        # response is an error (unlike a deliberate abort).
+        self.assertEqual(chunks, [b"x" * 5])
 
 
 class SimpleHTTPClientTestCase(AsyncHTTPTestCase, SimpleHTTPClientTestMixin):

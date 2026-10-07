@@ -670,6 +670,30 @@ class HTTPOutputError(Exception):
     pass
 
 
+class HTTPStreamAbort(Exception):
+    """Raise this exception to stop reading an HTTP message before it is complete.
+
+    On the client side, this may be raised from an
+    `~tornado.httpclient.HTTPRequest.streaming_callback` or
+    `~tornado.httpclient.HTTPRequest.header_callback` to indicate that the
+    caller has received all the headers or body chunks it needs and does not
+    want to wait for the rest of the response. The read is stopped
+    immediately, the partial response is delivered as a successful
+    `~tornado.httpclient.HTTPResponse` (keeping the status code and headers
+    sent by the server), and the underlying connection is closed because the
+    unread remainder of the body cannot be safely skipped or reused.
+
+    This is a deliberate form of flow control, not an error: it is
+    distinguished from the server closing the connection prematurely (which
+    results in an error response) and from any other exception raised by a
+    callback (which is reported as the response's error).
+
+    .. versionadded:: 6.6
+    """
+
+    pass
+
+
 class HTTPServerConnectionDelegate:
     """Implement this interface to handle requests from `.HTTPServer`.
 

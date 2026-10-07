@@ -39,8 +39,10 @@ CR_OR_LF_RE = re.compile(b"\r|\n")
 
 
 class _QuietException(Exception):
-    def __init__(self) -> None:
-        pass
+    def __init__(self, error: BaseException | None = None) -> None:
+        # The original exception that was logged and replaced by this one.
+        self.error = error
+        super().__init__(error)
 
 
 class _ExceptionLoggingContext:
@@ -63,11 +65,16 @@ class _ExceptionLoggingContext:
     ) -> None:
         if value is not None:
             assert typ is not None
-            # Let HTTPInputError pass through to higher-level handler
-            if isinstance(value, httputil.HTTPInputError):
+            # Let HTTPInputError pass through to higher-level handler.
+            # HTTPStreamAbort is a deliberate signal from a delegate (such
+            # as a client streaming callback) to stop reading early; pass
+            # it through as well without logging or replacing it.
+            if isinstance(
+                value, (httputil.HTTPInputError, httputil.HTTPStreamAbort)
+            ):
                 return None
             self.logger.error("Uncaught exception", exc_info=(typ, value, tb))
-            raise _QuietException
+            raise _QuietException(value)
 
 
 class HTTP1ConnectionParameters:
@@ -178,13 +185,24 @@ class HTTP1Connection(httputil.HTTPConnection):
         Returns a `.Future` that resolves to a bool after the full response has
         been read. The result is true if the stream is still open.
         """
+        # Keep a reference to the delegate the application actually talks
+        # to, even if we wrap it with a decompression delegate below. This
+        # is needed if reading is aborted early, when the wrapper's normal
+        # finish path must be bypassed.
+        message_delegate = delegate
         if self.params.decompress:
             delegate = _GzipMessageDelegate(
                 delegate, self.params.chunk_size, self._max_body_size
             )
-        return self._read_message(delegate)
+        return self._read_message(delegate, message_delegate)
 
-    async def _read_message(self, delegate: httputil.HTTPMessageDelegate) -> bool:
+    async def _read_message(
+        self,
+        delegate: httputil.HTTPMessageDelegate,
+        message_delegate: httputil.HTTPMessageDelegate | None = None,
+    ) -> bool:
+        if message_delegate is None:
+            message_delegate = delegate
         need_delegate_close = False
         try:
             header_future = self.stream.read_until_regex(
@@ -251,7 +269,7 @@ class HTTP1Connection(httputil.HTTPConnection):
                         )
                     # TODO: client delegates will get headers_received twice
                     # in the case of a 100-continue.  Document or change?
-                    await self._read_message(delegate)
+                    await self._read_message(delegate, message_delegate)
             else:
                 if headers.get("Expect") == "100-continue" and not self._write_finished:
                     self.stream.write(b"HTTP/1.1 100 (Continue)\r\n\r\n")
@@ -298,6 +316,34 @@ class HTTP1Connection(httputil.HTTPConnection):
                 await self.stream.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
             self.close()
             return False
+        except httputil.HTTPStreamAbort:
+            # The delegate (on the client, typically a streaming_callback or
+            # header_callback) has deliberately stopped reading the message
+            # before it was complete. Finalize what was received so far as a
+            # normal, successful response and then close the connection:
+            # since the rest of the framed body has not been consumed, the
+            # connection cannot be kept alive, because unread bytes from this
+            # response could be mistaken for the start of the next one. This
+            # is not an error, so it must be distinguished from both the
+            # server closing the connection prematurely and a delegate
+            # callback raising some other exception.
+            need_delegate_close = False
+            self._read_finished = True
+            if self.is_client:
+                with _ExceptionLoggingContext(app_log):
+                    message_delegate.finish()
+            self.close()
+            return False
+        except _QuietException:
+            if self.is_client:
+                # A client delegate (such as a streaming_callback) raised an
+                # exception that has already been logged and wrapped. Let it
+                # propagate to the client's error handler instead of notifying
+                # the delegate that the connection was closed, which would
+                # replace the original exception with a generic "connection
+                # closed" error.
+                need_delegate_close = False
+            raise
         finally:
             if need_delegate_close:
                 with _ExceptionLoggingContext(app_log):

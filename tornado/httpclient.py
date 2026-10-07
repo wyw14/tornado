@@ -52,6 +52,7 @@ from tornado.concurrent import (
     future_set_result_unless_cancelled,
 )
 from tornado.escape import native_str, utf8
+from tornado.httputil import HTTPStreamAbort
 from tornado.ioloop import IOLoop
 from tornado.util import Configurable
 
@@ -440,7 +441,11 @@ class HTTPRequest:
         :arg collections.abc.Callable streaming_callback: If set, ``streaming_callback`` will
            be run with each chunk of data as it is received, and
            ``HTTPResponse.body`` and ``HTTPResponse.buffer`` will be empty in
-           the final response.
+           the final response. The callback may return an awaitable for flow
+           control. If the callback only needs some of the data, it may raise
+           `HTTPStreamAbort` to stop reading the rest of the response; the
+           request then finishes successfully with the status code and
+           headers received so far.
         :arg collections.abc.Callable header_callback: If set, ``header_callback`` will
            be run with each header line as it is received (including the
            first line, e.g. ``HTTP/1.0 200 OK\r\n``, and a final line
@@ -448,7 +453,9 @@ class HTTPRequest:
            characters).  ``HTTPResponse.headers`` will be empty in the final
            response.  This is most useful in conjunction with
            ``streaming_callback``, because it's the only way to get access to
-           header data while the request is in progress.
+           header data while the request is in progress. Raising
+           `HTTPStreamAbort` from this callback cancels the reading of the
+           response body and completes the request with the headers received.
         :arg collections.abc.Callable prepare_curl_callback: If set, will be called with
            a ``pycurl.Curl`` object to allow the application to make additional
            ``setopt`` calls.
@@ -505,6 +512,12 @@ class HTTPRequest:
 
         .. versionadded:: 4.5
            The ``proxy_auth_mode`` argument.
+
+        .. versionadded:: 6.6
+           ``streaming_callback`` and ``header_callback`` may raise
+           `HTTPStreamAbort` to stop reading a response before the whole
+           body has been received. Currently supported by
+           `simple_httpclient.SimpleAsyncHTTPClient`.
         """
         # Note that some of these attributes go through property setters
         # defined below.

@@ -15,12 +15,17 @@ from typing import Any, Optional, Type
 
 from tornado import gen, httputil, version
 from tornado.escape import _unicode
-from tornado.http1connection import HTTP1Connection, HTTP1ConnectionParameters
+from tornado.http1connection import (
+    HTTP1Connection,
+    HTTP1ConnectionParameters,
+    _QuietException,
+)
 from tornado.httpclient import (
     AsyncHTTPClient,
     HTTPError,
     HTTPRequest,
     HTTPResponse,
+    HTTPStreamAbort,
     _RequestProxy,
     main,
 )
@@ -272,6 +277,9 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         self.code: int | None = None
         self.headers: httputil.HTTPHeaders | None = None
         self.chunks: list[bytes] = []
+        # Set to True when a streaming_callback or header_callback raises
+        # HTTPStreamAbort to stop reading the response early.
+        self._aborted = False
         self._decompressor = None
         # Timeout handle returned by IOLoop.add_timeout
         self._timeout: object = None
@@ -540,6 +548,12 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
     ) -> bool:
         if self.final_callback is not None:
             self._remove_timeout()
+            if isinstance(value, _QuietException) and value.error is not None:
+                # _QuietException wraps an exception that has already been
+                # logged by the HTTP/1 connection layer. Surface the original
+                # exception (such as one raised by a streaming_callback) to
+                # the caller rather than the internal wrapper.
+                value = value.error
             if isinstance(value, StreamClosedError):
                 if value.real_error is None:
                     value = HTTPStreamClosedError("Stream closed")
@@ -595,11 +609,16 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             return
 
         if self.request.header_callback is not None:
-            # Reassemble the start line.
-            self.request.header_callback("%s %s %s\r\n" % first_line)
-            for k, v in self.headers.get_all():
-                self.request.header_callback(f"{k}: {v}\r\n")
-            self.request.header_callback("\r\n")
+            try:
+                # Reassemble the start line.
+                self.request.header_callback("%s %s %s\r\n" % first_line)
+                for k, v in self.headers.get_all():
+                    self.request.header_callback(f"{k}: {v}\r\n")
+                self.request.header_callback("\r\n")
+            except HTTPStreamAbort:
+                # The caller only wants the headers; stop before the body.
+                self._aborted = True
+                raise
 
     def _should_follow_redirect(self) -> bool:
         if self.request.follow_redirects:
@@ -617,7 +636,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         data = b"".join(self.chunks)
         self._remove_timeout()
         original_request = getattr(self.request, "original_request", self.request)
-        if self._should_follow_redirect():
+        if not self._aborted and self._should_follow_redirect():
             assert isinstance(self.request, _RequestProxy)
             assert self.headers is not None
             new_request = copy.copy(self.request.request)
@@ -721,10 +740,31 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             # We're going to follow a redirect so just discard the body.
             return None
         if self.request.streaming_callback is not None:
-            return self.request.streaming_callback(chunk)
+            try:
+                result = self.request.streaming_callback(chunk)
+            except HTTPStreamAbort:
+                # The caller has all the data it wants; stop reading.
+                # (The HTTP1Connection aborts the rest of the response and
+                # calls finish(), so the result is a successful partial
+                # response rather than an error.)
+                self._aborted = True
+                raise
+            if result is not None:
+                return self._await_streaming_callback(result)
+            return None
         else:
             self.chunks.append(chunk)
             return None
+
+    async def _await_streaming_callback(
+        self, awaitable: Awaitable[None]
+    ) -> None:
+        try:
+            await awaitable
+        except HTTPStreamAbort:
+            # The caller has all the data it wants; stop reading.
+            self._aborted = True
+            raise
 
 
 if __name__ == "__main__":
